@@ -1,0 +1,80 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Parallel DFA Minimization</title>
+
+    <link rel="stylesheet" media="screen" href="l.css">
+
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Parallel DFA Minimization">
+    <meta name="robots" content="all">
+</head>
+
+<body>
+<div class="page-wrapper">
+
+    <section class="intro" id="intro">
+        <header>
+            <h2>Parallel DFA Minimization</h2>
+        </header>
+
+        <div class="summary" id="summary" role="article">
+            <p>Hopcroft's Algorithm is a DFA Minimization Algorithm that is known to have an asymptotic linearithmic time complexity. This project is an attempt to correctly implement a modified version of the algorithm whose complexity is approximately the same, for multi-core systems.</p>
+        </div>
+
+        <div class="background" id="background" role="article">
+            <h3>Background</h3>
+            <p><var>Set</var> is a compressed storage for representing the precomputed back-edges. <var>insert</var> and iterating over the array are the only two operations on this structure.</p>
+            <p><var>Array</var> is equivalent to <var>std::vector</var>. Again, <var>insert</var> and iterating are the only operations performed on this structure.</p>
+            <p><var>Seq</var> dynamically picks a good representation, of BitVector vs ElemArray, for represting partitions. It supports O(n) <var>partition</var> and <var>map</var>.</p>
+            <p>The final structure, that puts it all together is <var>DFA</var>. The main operation performed on this is <var>minimize</var>, and this is also the method that is parallelized. There are a few more important ones, including <var>operator==</var> (for testing whether a DFA is isomorphic to another DFA) and <var>reachable</var> (gets the reachable part of the DFA, only used when computing the powerset automata, to test against the known minimal DFA).</p>
+            <p>The algorithm takes an input DFA and returns the minimized version of the DFA. Detailed examples can be found in the <var>test#.cpp</var> and <var>benchmark#.cpp</var> files.<p>
+            <p>Very little is strictly computationally expensive, and most of the program is actually limited by bandwidth, however, <var>partition</var> and <var>map</var> both take a lot of time, and with a large amount of compression (by a factor of 8), it becomes less bandwidth-bound. Both of these operations can benefit from parallelization. While <var>partition</var> might benefit slightly from SIMD execution, it probably would not be helpful because there are a lot of efficient operations that can be done only on 64bit values or less (like <var>popcnt</var>). Moreover, SIMD does not support atomic logical OR, which is a major downside. There are a lot of dependencies, and these can't be pre-computed. The outer loops of the minimization algorithm are almost strictly sequential, and while I made changes to the algorithm itself to allow for some parallelization, there is still a large sequential portion.</p>
+        </div>
+    </section>
+
+    <div class="main">
+        <div class="challenges" id="challenges" role="article">
+            <h3>Approach</h3>
+            <p>I used OpenMP for parallelizing and I targetted the GHC machines for benchmarking. <var>map</var> and <var>partition</var> were, in some cases, run in parallel across the available cores, and in the average case each instance of <var>Seq</var> was run in sequential, but they were all run at the same time. This is, of course, a change in the original algorithm, and it no longer meets the worst-case complexity bound, but this does not affect the average-case complexity.</p>
+            <p>The most helpful optimization was in compressing as much as possible and then vectorizing it. First was the change from boolean arrays to bitvectors. Then, by vectorizing, I don't mean using SIMD, but rather, using 64-bit values which support very efficient operations like counting the number of '1's (popcnt), taking the complement (~), partition (&amp;, ^), and even computing union (|). Perhaps an implementation using SIMD could help even more, but it seems that 4 popcnts are significantly faster than any avx instruction for counting the number of bits, and in addition, SIMD wouldn't support atomic (|).</p>
+            <p>Another helpful optimization was to interleaving the loading of cache lines. This property is controlled by <var>CACELINE</var>, in <var>Config.h</var>.</p>
+            <p>The only other thing that helped was to solve the problem of having a lot of divergence by, rather than using a dynamic scheduling, use interleaved static scheduling. This is because the overhead of using a truely dynamic scheduling was simply too high, and while there is expected to be a lot of divergence, there is not ALWAYS divergence, and in the cases that it isn't, the cost is too high. Other things, like basing the static scheduling on the size of the cache line, also helped to some degree, especially when the number of threads was small.</p>
+            <p>The result of all of these optimizations were not just for the speedup, but even compared to the original algorithm, the new implementation became almost 3x as fast, but because it's less work-efficient, in some tests (well only 1 really, the one that cannot be minimized), it became worse.</p>
+            <h3>References</h3>
+            <p>I did not start from an existing code-base. Pseudocode for the original algorithm is available on <a href="https://en.wikipedia.org/wiki/DFA_minimization#Hopcroft.27s_algorithm">Wikipedia</a>.
+        </div>
+
+        <div class="goals">
+            <h3>Results</h3>
+            <p>Speedup is the measure of performance I was using while optimizing my algorithm.</p>
+            <p>The experimental setup included a set of pre-determined DFA topologies that is fairly easy to speedup, some pseudo-randomly generated DFAs, and two powerset automata. The pre-determined set and the powerset automata were used for both testing and benchmarking, while the randomly generated ones, of course, were used only for benchmarking. The size of the inputs for benchmarking were as large as possible without taking forever to complete the benchmarks. The baseline comparison is the same implementation with the number of threads set to 1.</p>
+            <p>The number of nodes is not the only thing that changes between inputs, but also the topology, so it is hard to quantify the results solely based on the problem size. However, it is certainly the case that, the speedup increases greatly depending on the size of the input, given that it can complete that problem in a short amount of time.</p>
+            <p>As I have already mentioned in the approach, the biggest problems were bandwidth, divergence, and while the existence of dependencies is also a limit to the speedup, it is not a limit that can be overcome with this algorithm, no matter the implementation. I can't provide exact evidence for each of these separately, but checkingout older revisions of the git repo (or alternatively, looking at the difference in results table shown below), both offer evidence that the fixes made really did improve the speedup. There is evidence for bandwidth: If you modify <var>CACHELINE</var> to something larger, the program becomes slower, as a result of loading lines from DRAM from vastly different locations, meaning that it's very likely that the problem is bandwidth-bound. And since the fixes involved reducing dependencies and reducing bandwidth, surely these are both major problems that limited the speedup of the program.</p>
+            <p>I manually added a number of debug statements that measure the amount of time a certain block of code takes, and then at the end, it makes a histogram, and outputs it (see <var>FINETUNING</var> in <var>Config.h</var>). Using these results, I was able to identify the blocks of code that get WORSE when the number of threads grows large (usually, this is a result of bandwidth and cache limits), and using this information, I was able to optimize. The statements are still left in the code but only enabled by the above parameter. There are still a lot of dependencies, so unless the problem size is increased, there will be a point after which using more cores does not help. There is still a lot of room to improve, in the most obvious places: the <var>map</var> and <var>partition</var>. Neither of these achieve a perfect speedup as a result of the bandwidth requirements.</p>
+            <p>Perhaps using a GPU would have been superior to using a CPU because bandwidth is certainly the limiting the factor, but at the same time, if a GPU implementation was chosen, perhaps the resulting divergence would not have been so good either, and certainly a large amount of synchronization would be required regardless.</p>
+        </div>
+
+        <div class="checkpoint" id="checkpoint" role="article">
+        
+        </div>
+                </tr>
+            </table>
+        
+        </div>
+    </div>
+
+                <nav>
+                    <ul>
+                </nav>
+            </div>
+        </div>
+    </aside>
+</div>
+
+<div class="extra1" role="presentation"></div><div class="extra2" role="presentation"></div><div class="extra3" role="presentation"></div>
+<div class="extra4" role="presentation"></div><div class="extra5" role="presentation"></div><div class="extra6" role="presentation"></div>
+</body>
+</html>
